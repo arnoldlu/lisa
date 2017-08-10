@@ -30,7 +30,7 @@ import logging
 from analysis_register import AnalysisRegister
 from collections import namedtuple
 from devlib.utils.misc import memoized
-from trappy.utils import listify
+from trappy.utils import listify, handle_duplicate_index
 
 
 NON_IDLE_STATE = -1
@@ -51,10 +51,6 @@ class Trace(object):
     :param events: events to be parsed (everything in the trace by default)
     :type events: list(str)
 
-    :param tasks: filter data for the specified tasks only. If None (default),
-        use data for all tasks found in the trace.
-    :type tasks: list(str) or NoneType
-
     :param window: time window to consider when parsing the trace
     :type window: tuple(int, int)
 
@@ -74,7 +70,7 @@ class Trace(object):
     """
 
     def __init__(self, platform, data_dir, events,
-                 tasks=None, window=(0, None),
+                 window=(0, None),
                  normalize_time=True,
                  trace_format='FTrace',
                  plots_dir=None,
@@ -101,9 +97,6 @@ class Trace(object):
         # Time the system was overutilzied
         self.overutilized_time = 0
         self.overutilized_prc = 0
-
-        # The dictionary of tasks descriptors available in the dataset
-        self.tasks = {}
 
         # List of events required by user
         self.events = []
@@ -133,7 +126,7 @@ class Trace(object):
         self.plots_prefix = plots_prefix
 
         self.__registerTraceEvents(events)
-        self.__parseTrace(data_dir, tasks, window, normalize_time,
+        self.__parseTrace(data_dir, window, normalize_time,
                           trace_format)
         self.__computeTimeSpan()
 
@@ -186,7 +179,7 @@ class Trace(object):
             self.x_max = self.time_range
         else:
             self.x_max = t_max
-        self._log.info('Set plots time range to (%.6f, %.6f)[s]',
+        self._log.debug('Set plots time range to (%.6f, %.6f)[s]',
                        self.x_min, self.x_max)
 
     def __registerTraceEvents(self, events):
@@ -202,17 +195,17 @@ class Trace(object):
             self.events = events
         else:
             raise ValueError('Events must be a string or a list of strings')
+        # Register devlib fake cpu_frequency events
+        if 'cpu_frequency' in events:
+            self.events.append('cpu_frequency_devlib')
 
-    def __parseTrace(self, path, tasks, window, normalize_time, trace_format):
+    def __parseTrace(self, path, window, normalize_time, trace_format):
         """
         Internal method in charge of performing the actual parsing of the
         trace.
 
         :param path: path to the trace folder (or trace file)
         :type path: str
-
-        :param tasks: filter data for the specified tasks only
-        :type tasks: list(str)
 
         :param window: time window to consider when parsing the trace
         :type window: tuple(int, int)
@@ -228,11 +221,11 @@ class Trace(object):
         self._log.debug('Loading [sched] events from trace in [%s]...', path)
         self._log.debug('Parsing events: %s', self.events)
         if trace_format.upper() == 'SYSTRACE' or path.endswith('html'):
-            self._log.info('Parsing SysTrace format...')
+            self._log.debug('Parsing SysTrace format...')
             trace_class = trappy.SysTrace
             self.trace_format = 'SysTrace'
         elif trace_format.upper() == 'FTRACE':
-            self._log.info('Parsing FTrace format...')
+            self._log.debug('Parsing FTrace format...')
             trace_class = trappy.FTrace
             self.trace_format = 'FTrace'
         else:
@@ -253,6 +246,9 @@ class Trace(object):
             raise ValueError('The trace does not contain useful events '
                              'nor function stats')
 
+        # Index PIDs and Task names
+        self.__loadTasksNames()
+
         # Setup internal data reference to interesting events/dataframes
 
         self._sanitize_SchedLoadAvgCpu()
@@ -263,8 +259,6 @@ class Trace(object):
         self._sanitize_SchedEnergyDiff()
         self._sanitize_SchedOverutilized()
         self._sanitize_CpuFrequency()
-
-        self.__loadTasksNames(tasks)
 
         # Compute plot window
         if not normalize_time:
@@ -291,26 +285,23 @@ class Trace(object):
         for evt in self.available_events:
             self._log.debug(' - %s', evt)
 
-    def __loadTasksNames(self, tasks):
+    def __loadTasksNames(self):
         """
         Try to load tasks names using one of the supported events.
-
-        :param tasks: list of task names. If None, load all tasks found.
-        :type tasks: list(str) or NoneType
         """
-        def load(tasks, event, name_key, pid_key):
+        def load(event, name_key, pid_key):
             df = self._dfg_trace_event(event)
-            if tasks is None:
-                tasks = df[name_key].unique()
-            self.getTasks(df, tasks, name_key=name_key, pid_key=pid_key)
             self._scanTasks(df, name_key=name_key, pid_key=pid_key)
 
         if 'sched_switch' in self.available_events:
-            load(tasks, 'sched_switch', 'next_comm', 'next_pid')
-        elif 'sched_load_avg_task' in self.available_events:
-            load(tasks, 'sched_load_avg_task', 'comm', 'pid')
-        else:
-            self._log.warning('Failed to load tasks names from trace events')
+            load('sched_switch', 'prev_comm', 'prev_pid')
+            return
+
+        if 'sched_load_avg_task' in self.available_events:
+            load('sched_load_avg_task', 'comm', 'pid')
+            return
+
+        self._log.warning('Failed to load tasks names from trace events')
 
     def hasEvents(self, dataset):
         """
@@ -341,7 +332,7 @@ class Trace(object):
                 te = df.index[-1]
             self.time_range = te - ts
 
-        self._log.info('Collected events spans a %.3f [s] time interval',
+        self._log.debug('Collected events spans a %.3f [s] time interval',
                        self.time_range)
 
         # Build a stat on trace overutilization
@@ -350,7 +341,7 @@ class Trace(object):
             self.overutilized_time = df[df.overutilized == 1].len.sum()
             self.overutilized_prc = 100. * self.overutilized_time / self.time_range
 
-            self._log.info('Overutilized time: %.6f [s] (%.3f%% of trace time)',
+            self._log.debug('Overutilized time: %.6f [s] (%.3f%% of trace time)',
                            self.overutilized_time, self.overutilized_prc)
 
     def _scanTasks(self, df, name_key='comm', pid_key='pid'):
@@ -370,89 +361,64 @@ class Trace(object):
         :type pid_key: str
         """
         df = df[[name_key, pid_key]]
-        self._tasks_by_name = df.set_index(name_key)
-        self._tasks_by_pid = df.set_index(pid_key)
+        self._tasks_by_pid = (df.drop_duplicates(subset=pid_key, keep='last')
+                .rename(columns={
+                    pid_key : 'PID',
+                    name_key : 'TaskName'})
+                .set_index('PID').sort_index())
 
     def getTaskByName(self, name):
         """
         Get the PIDs of all tasks with the specified name.
 
+        The same PID can have different task names, mainly because once a task
+        is generated it inherits the parent name and then its name is updated
+        to represent what the task really is.
+
+        This API works under the assumption that a task name is updated at
+        most one time and it always considers the name a task had the last time
+        it has been scheduled for execution in the current trace.
+
         :param name: task name
         :type name: str
+
+        :return: a list of PID for tasks which name matches the required one,
+                 the last time they ran in the current trace
         """
-        if name not in self._tasks_by_name.index:
-            return []
-        if len(self._tasks_by_name.ix[name].values) > 1:
-            return list({task[0] for task in
-                         self._tasks_by_name.ix[name].values})
-        return [self._tasks_by_name.ix[name].values[0]]
+        return (self._tasks_by_pid[self._tasks_by_pid.TaskName == name]
+                    .index.tolist())
 
     def getTaskByPid(self, pid):
         """
-        Get the names of all tasks with the specified PID.
+        Get the name of the task with the specified PID.
+
+        The same PID can have different task names, mainly because once a task
+        is generated it inherits the parent name and then its name is
+        updated to represent what the task really is.
+
+        This API works under the assumption that a task name is updated at
+        most one time and it always report the name the task had the last time
+        it has been scheduled for execution in the current trace.
 
         :param name: task PID
         :type name: int
+
+        :return: the name of the task which PID matches the required one,
+                 the last time they ran in the current trace
         """
-        if pid not in self._tasks_by_pid.index:
-            return []
-        if len(self._tasks_by_pid.ix[pid].values) > 1:
-            return list({task[0] for task in
-                         self._tasks_by_pid.ix[pid].values})
-        return [self._tasks_by_pid.ix[pid].values[0]]
+        try:
+            return self._tasks_by_pid.ix[pid].values[0]
+        except KeyError:
+            return None
 
-    def getTasks(self, dataframe=None,
-                 task_names=None, name_key='comm', pid_key='pid'):
+    def getTasks(self):
         """
-        Helper function to get PIDs of specified tasks.
+        Get a dictionary of all the tasks in the Trace.
 
-        This method can take a Pandas dataset in input to be used to fiter out
-        the PIDs of all the specified tasks. If a dataset is not provided,
-        previously filtered PIDs are returned.
-
-        If a list of task names is not provided, all tasks detected in the trace
-        will be used. The specified dataframe must provide at least two columns
-        reporting the task name and the task PID. The default values of this
-        colums could be specified using the provided parameters.
-
-        :param dataframe: A Pandas dataframe containing at least 'name_key' and
-            'pid_key' columns. If None, the all PIDs are returned.
-        :type dataframe: :mod:`pandas.DataFrame`
-
-        :param task_names: The list of tasks to get the PID of (default: all
-            tasks)
-        :type task_names: list(str)
-
-        :param name_key: The name of the dataframe columns containing task
-            names
-        :type name_key: str
-
-        :param pid_key: The name of the dataframe columns containing task PIDs
-        :type pid_key: str
+        :return: a dictionary which maps each PID to the corresponding task
+                 name
         """
-        if task_names is None:
-            task_names = self.tasks.keys()
-        if dataframe is None:
-            return {k: v for k, v in  self.tasks.iteritems() if k in task_names}
-        df = dataframe
-        self._log.debug('Lookup dataset for tasks...')
-        for tname in task_names:
-            self._log.debug('Lookup for task [%s]...', tname)
-            results = df[df[name_key] == tname][[name_key, pid_key]]
-            if len(results) == 0:
-                self._log.error('  task %16s NOT found', tname)
-                continue
-            (name, pid) = results.head(1).values[0]
-            if name != tname:
-                self._log.error('  task %16s NOT found', tname)
-                continue
-            if tname not in self.tasks:
-                self.tasks[tname] = {}
-            pids = list(results[pid_key].unique())
-            self.tasks[tname]['pid'] = pids
-            self._log.debug('  task %16s found, pid: %s',
-                            tname, self.tasks[tname]['pid'])
-        return self.tasks
+        return self._tasks_by_pid.TaskName.to_dict()
 
 
 ###############################################################################
@@ -610,6 +576,8 @@ class Trace(object):
         """
         If a energy model is provided, some signals are added to the
         sched_energy_diff trace event data frame.
+
+        Also convert between existing field name formats for sched_energy_diff
         """
         if not self.hasEvents('sched_energy_diff') \
            or 'nrg_model' not in self.platform:
@@ -625,9 +593,17 @@ class Trace(object):
 
         power_max = em_lcpu['nrg_max'] * lcpus + em_bcpu['nrg_max'] * bcpus + \
             em_lcluster['nrg_max'] + em_bcluster['nrg_max']
-        print "Maximum estimated system energy: {0:d}".format(power_max)
+        self._log.debug(
+            "Maximum estimated system energy: {0:d}".format(power_max))
 
         df = self._dfg_trace_event('sched_energy_diff')
+
+        translations = {'nrg_d' : 'nrg_diff',
+                        'utl_d' : 'usage_delta',
+                        'payoff' : 'nrg_payoff'
+        }
+        df.rename(columns=translations, inplace=True)
+
         df['nrg_diff_pct'] = SCHED_LOAD_SCALE * df.nrg_diff / power_max
 
         # Tag columns by usage_delta
@@ -670,10 +646,69 @@ class Trace(object):
         Verify that all platform reported clusters are frequency coherent (i.e.
         frequency scaling is performed at a cluster level).
         """
-        if not self.hasEvents('cpu_frequency'):
+        if not self.hasEvents('cpu_frequency_devlib'):
             return
+
+        devlib_freq = self._dfg_trace_event('cpu_frequency_devlib')
+        devlib_freq.rename(columns={'cpu_id':'cpu'}, inplace=True)
+        devlib_freq.rename(columns={'state':'frequency'}, inplace=True)
+
         df = self._dfg_trace_event('cpu_frequency')
         clusters = self.platform['clusters']
+
+        # devlib always introduces fake cpu_frequency events, in case the
+        # OS has not generated cpu_frequency envets there are the only
+        # frequency events to report
+        if len(df) == 0:
+            # Register devlib injected events as 'cpu_frequency' events
+            setattr(self.ftrace.cpu_frequency, 'data_frame', devlib_freq)
+            df = devlib_freq
+            self.available_events.append('cpu_frequency')
+
+        # make sure fake cpu_frequency events are never interleaved with
+        # OS generated events
+        else:
+            if len(devlib_freq) > 0:
+
+                # Frequencies injection is done in a per-cluster based.
+                # This is based on the assumption that clusters are
+                # frequency choerent.
+                # For each cluster we inject devlib events only if
+                # these events does not overlaps with os-generated ones.
+
+                # Inject "initial" devlib frequencies
+                os_df = df
+                dl_df = devlib_freq.iloc[:self.platform['cpus_count']]
+                for _,c in self.platform['clusters'].iteritems():
+                    dl_freqs = dl_df[dl_df.cpu.isin(c)]
+                    os_freqs = os_df[os_df.cpu.isin(c)]
+                    self._log.debug("First freqs for %s:\n%s", c, dl_freqs)
+                    # All devlib events "before" os-generated events
+                    self._log.debug("Min os freq @: %s", os_freqs.index.min())
+                    if os_freqs.empty or \
+                       os_freqs.index.min() > dl_freqs.index.max():
+                        self._log.debug("Insert devlib freqs for %s", c)
+                        df = pd.concat([dl_freqs, df])
+
+                # Inject "final" devlib frequencies
+                os_df = df
+                dl_df = devlib_freq.iloc[self.platform['cpus_count']:]
+                for _,c in self.platform['clusters'].iteritems():
+                    dl_freqs = dl_df[dl_df.cpu.isin(c)]
+                    os_freqs = os_df[os_df.cpu.isin(c)]
+                    self._log.debug("Last freqs for %s:\n%s", c, dl_freqs)
+                    # All devlib events "after" os-generated events
+                    self._log.debug("Max os freq @: %s", os_freqs.index.max())
+                    if os_freqs.empty or \
+                       os_freqs.index.max() < dl_freqs.index.min():
+                        self._log.debug("Append devlib freqs for %s", c)
+                        df = pd.concat([df, dl_freqs])
+
+                df.sort_index(inplace=True)
+
+            setattr(self.ftrace.cpu_frequency, 'data_frame', df)
+
+        # Frequency Coherency Check
         for _, cpus in clusters.iteritems():
             cluster_df = df[df.cpu.isin(cpus)]
             for chunk in self._chunker(cluster_df, len(cpus)):
@@ -716,7 +751,9 @@ class Trace(object):
         """
         if os.path.isdir(path):
             path = os.path.join(path, 'trace.stats')
-        if path.endswith('dat') or path.endswith('html'):
+        if (path.endswith('dat') or
+            path.endswith('txt') or
+            path.endswith('html')):
             pre, ext = os.path.splitext(path)
             path = pre + '.stats'
         if not os.path.isfile(path):
@@ -743,14 +780,16 @@ class Trace(object):
         """
         Build a square wave representing the active (i.e. non-idle) CPU time,
         i.e.:
-            cpu_active[t] == 1 if the CPU is reported to be non-idle by cpuidle
-                             at time t
-            cpu_active[t] == 0 otherwise
+
+          cpu_active[t] == 1 if the CPU is reported to be non-idle by cpuidle at
+          time t
+          cpu_active[t] == 0 otherwise
 
         :param cpu: CPU ID
         :type cpu: int
 
-        :returns: :mod:`pandas.Series`
+        :returns: A :mod:`pandas.Series` or ``None`` if the trace contains no
+                  "cpu_idle" events
         """
         if not self.hasEvents('cpu_idle'):
             self._log.warning('Events [cpu_idle] not found, '
@@ -774,21 +813,25 @@ class Trace(object):
             entry_0 = pd.Series(cpu_active.iloc[0] ^ 1, index=[start_time])
             cpu_active = pd.concat([entry_0, cpu_active])
 
-        return cpu_active
+        # Fix sequences of wakeup/sleep events reported with the same index
+        return handle_duplicate_index(cpu_active)
+
 
     @memoized
     def getClusterActiveSignal(self, cluster):
         """
         Build a square wave representing the active (i.e. non-idle) cluster
         time, i.e.:
-            cluster_active[t] == 1 if at least one CPU is reported to be
-                                   non-idle by CPUFreq at time t
-            cluster_active[t] == 0 otherwise
+
+          cluster_active[t] == 1 if at least one CPU is reported to be non-idle
+          by CPUFreq at time t
+          cluster_active[t] == 0 otherwise
 
         :param cluster: list of CPU IDs belonging to a cluster
         :type cluster: list(int)
 
-        :returns: :mod:`pandas.Series`
+        :returns: A :mod:`pandas.Series` or ``None`` if the trace contains no
+                  "cpu_idle" events
         """
         if not self.hasEvents('cpu_idle'):
             self._log.warning('Events [cpu_idle] not found, '

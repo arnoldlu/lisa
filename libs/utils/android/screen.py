@@ -16,6 +16,8 @@
 #
 
 import logging
+from system import System
+from time import sleep
 
 class Screen(object):
     """
@@ -128,5 +130,29 @@ class Screen(object):
         Screen.set_brightness(target)
         Screen.set_dim(target)
         Screen.set_timeout(target)
+
+    @staticmethod
+    def get_screen_density(target):
+        """
+        Get screen density of the device.
+        """
+        return target.execute('getprop ro.sf.lcd_density')
+
+    @staticmethod
+    def set_screen(target, on=True):
+        log = logging.getLogger('Screen')
+        if not on:
+            log.info('Setting screen OFF')
+            System.sleep(target)
+            return
+        log.info('Setting screen ON')
+        System.wakeup(target)
+
+    @staticmethod
+    def unlock(target):
+       Screen.set_screen(target, on=True)
+       sleep(1)
+       System.menu(target)
+       System.home(target)
 
 # vim :set tabstop=4 shiftwidth=4 expandtab

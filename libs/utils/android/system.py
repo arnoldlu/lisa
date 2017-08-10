@@ -21,8 +21,13 @@ from devlib.utils.android import adb_command
 from devlib import TargetError
 import os
 import pexpect as pe
+from time import sleep
 
 GET_FRAMESTATS_CMD = 'shell dumpsys gfxinfo {} > {}'
+
+# See https://developer.android.com/reference/android/content/Intent.html#setFlags(int)
+FLAG_ACTIVITY_NEW_TASK = 0x10000000
+FLAG_ACTIVITY_CLEAR_TASK = 0x00008000
 
 class System(object):
     """
@@ -30,7 +35,7 @@ class System(object):
     """
 
     @staticmethod
-    def systrace_start(target, trace_file, time,
+    def systrace_start(target, trace_file, time=None,
                        events=['gfx', 'view', 'sched', 'freq', 'idle']):
 
         log = logging.getLogger('System')
@@ -46,10 +51,16 @@ class System(object):
                             target.CATAPULT_HOME)
                 return None
 
-        #  Format the command according to the specified time and events
-        systrace_pattern = "{} -e {} -o {} {} -t {}"
-        trace_cmd = systrace_pattern.format(systrace_path, target.conf['device'],
-                                            trace_file, " ".join(events), time)
+        #  Format the command according to the specified arguments
+        device = target.conf.get('device', '')
+        if device:
+            device = "-e {}".format(device)
+        systrace_pattern = "{} {} -o {} {}"
+        trace_cmd = systrace_pattern.format(systrace_path, device,
+                                            trace_file, " ".join(events))
+        if time is not None:
+            trace_cmd += " -t {}".format(time)
+
         log.info('SysTrace: %s', trace_cmd)
 
         # Actually spawn systrace
@@ -77,6 +88,37 @@ class System(object):
         except TargetError:
             log = logging.getLogger('System')
             log.warning('Failed to toggle airplane mode, permission denied.')
+
+    @staticmethod
+    def _set_svc(target, cmd, on=True):
+        mode = 'enable' if on else 'disable'
+        try:
+            target.execute('svc {} {}'.format(cmd, mode), as_root=True)
+        except TargetError:
+            log = logging.getLogger('System')
+            log.warning('Failed to toggle {} mode, permission denied.'\
+                        .format(cmd))
+
+    @staticmethod
+    def set_mobile_data(target, on=True):
+        """
+        Set mobile data connectivity
+        """
+        System._set_svc(target, 'data', on)
+
+    @staticmethod
+    def set_wifi(target, on=True):
+        """
+        Set mobile data connectivity
+        """
+        System._set_svc(target, 'wifi', on)
+
+    @staticmethod
+    def set_nfc(target, on=True):
+        """
+        Set mobile data connectivity
+        """
+        System._set_svc(target, 'nfc', on)
 
     @staticmethod
     def start_app(target, apk_name):
@@ -114,6 +156,29 @@ class System(object):
         :type action_args: str
         """
         target.execute('am start -a {} {}'.format(action, action_args))
+
+    @staticmethod
+    def view_uri(target, uri, force_new=True):
+        """
+        Start a view activity by specifying a URI
+
+        :param uri: URI of the item to display
+        :type uri: str
+
+        :param force_new: Force the viewing application to be
+            relaunched if it is already running
+        :type force_new: bool
+        """
+        arguments = '-d {}'.format(uri)
+
+        if force_new:
+            # Activity flags ensure the app is restarted
+            arguments = '{} -f {}'.format(arguments,
+                FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK)
+
+        System.start_action(target, 'android.intent.action.VIEW', arguments)
+        # Wait for the viewing application to be completely loaded
+        sleep(5)
 
     @staticmethod
     def force_stop(target, apk_name, clear=False):
@@ -252,6 +317,46 @@ class System(object):
         target.execute('input keyevent KEYCODE_BACK')
 
     @staticmethod
+    def wakeup(target):
+        """
+        Wake up the system if its sleeping
+
+        :param target: instance of devlib Android target
+        :type target: devlib.target.AndroidTarget
+        """
+        target.execute('input keyevent KEYCODE_WAKEUP')
+
+    @staticmethod
+    def sleep(target):
+        """
+        Make system sleep if its awake
+
+        :param target: instance of devlib Android target
+        :type target: devlib.target.AndroidTarget
+        """
+        target.execute('input keyevent KEYCODE_SLEEP')
+
+    @staticmethod
+    def volume(target, times=1, direction='down'):
+        """
+        Increase or decrease volume
+
+        :param target: instance of devlib Android target
+        :type target: devlib.target.AndroidTarget
+
+        :param times: number of times to perform operation
+        :type times: int
+
+        :param direction: which direction to increase (up/down)
+        :type direction: str
+        """
+        for i in range(times):
+            if direction == 'up':
+                target.execute('input keyevent KEYCODE_VOLUME_UP')
+            elif direction == 'down':
+                target.execute('input keyevent KEYCODE_VOLUME_DOWN')
+
+    @staticmethod
     def gfxinfo_reset(target, apk_name):
         """
         Reset gfxinfo frame statistics for a given app.
@@ -263,6 +368,7 @@ class System(object):
         :type apk_name: str
         """
         target.execute('dumpsys gfxinfo {} reset'.format(apk_name))
+        sleep(1)
 
     @staticmethod
     def gfxinfo_get(target, apk_name, out_file):

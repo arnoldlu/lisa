@@ -26,15 +26,17 @@ import time
 import unittest
 
 import devlib
+from devlib.utils.misc import memoized, which
+from devlib import Platform, TargetError
+from trappy.stats.Topology import Topology
 
 from wlgen import RTA
 from energy import EnergyMeter
+from energy_model import EnergyModel
 from conf import JsonConf
-
-from devlib.utils.misc import memoized
-from trappy.stats.Topology import Topology
-
-from devlib import Platform
+from platforms.juno_energy import juno_energy
+from platforms.hikey_energy import hikey_energy
+from platforms.pixel_energy import pixel_energy
 
 USERNAME_DEFAULT = 'root'
 PASSWORD_DEFAULT = ''
@@ -54,51 +56,115 @@ class ShareState(object):
         self.__dict__ = self.__shared_state
 
 class TestEnv(ShareState):
+    """
+    Represents the environment configuring LISA, the target, and the test setup
+
+    The test environment is defined by:
+
+    - a target configuration (target_conf) defining which HW platform we
+      want to use to run the experiments
+    - a test configuration (test_conf) defining which SW setups we need on
+      that HW target
+    - a folder to collect the experiments results, which can be specified
+      using the test_conf::results_dir option and is by default wiped from
+      all the previous contents (if wipe=True)
+
+    :param target_conf:
+        Configuration defining the target to run experiments on. May be
+
+            - A dict defining the values directly
+            - A path to a JSON file containing the configuration
+            - ``None``, in which case $LISA_HOME/target.config is used.
+
+        You need to provide the information needed to connect to the
+        target. For SSH targets that means "host", "username" and
+        either "password" or "keyfile". All other fields are optional if
+        the relevant features aren't needed. Has the following keys:
+
+        **host**
+            Target IP or MAC address for SSH access
+        **username**
+            For SSH access
+        **keyfile**
+            Path to SSH key (alternative to password)
+        **password**
+            SSH password (alternative to keyfile)
+        **device**
+            Target Android device ID if using ADB
+        **port**
+            Port for Android connection default port is 5555
+        **ANDROID_HOME**
+            Path to Android SDK. Defaults to ``$ANDROID_HOME`` from the
+            environment.
+        **rtapp-calib**
+            Calibration values for RT-App. If unspecified, LISA will
+            calibrate RT-App on the target. A message will be logged with
+            a value that can be copied here to avoid having to re-run
+            calibration on subsequent tests.
+        **tftp**
+            Directory path containing kernels and DTB images for the
+            target. LISA does *not* manage this TFTP server, it must be
+            provided externally. Optional.
+
+    :param test_conf: Configuration of software for target experiments. Takes
+                      the same form as target_conf. Fields are:
+
+        **modules**
+            Devlib modules to be enabled. Default is []
+        **exclude_modules**
+            Devlib modules to be disabled. Default is [].
+        **tools**
+            List of tools (available under ./tools/$ARCH/) to install on
+            the target. Names, not paths (e.g. ['ftrace']). Default is [].
+        **ping_time**, **reboot_time**
+            Override parameters to :meth:`reboot` method
+        **__features__**
+            List of test environment features to enable. Options are:
+
+            "no-kernel"
+                do not deploy kernel/dtb images
+            "no-reboot"
+                do not force reboot the target at each configuration change
+            "debug"
+                enable debugging messages
+
+        **ftrace**
+            Configuration for ftrace. Dictionary with keys:
+
+            events
+                events to enable.
+            functions
+                functions to enable in the function tracer. Optional.
+            buffsize
+                Size of buffer. Default is 10240.
+
+        **results_dir**
+            location of results of the experiments
+
+    :param wipe: set true to cleanup all previous content from the output
+                 folder
+    :type wipe: bool
+
+    :param force_new: Create a new TestEnv object even if there is one available
+                      for this session.  By default, TestEnv only creates one
+                      object per session, use this to override this behaviour.
+    :type force_new: bool
+    """
 
     _initialized = False
 
     def __init__(self, target_conf=None, test_conf=None, wipe=True,
                  force_new=False):
-        """
-        Initialize the LISA test environment.
-
-        The test environment is defined by:
-        - a target configuration (target_conf) defining which HW platform we
-        want to use to run the experiments
-        - a test configuration (test_conf) defining which SW setups we need on
-        that HW target
-        - a folder to collect the experiments results, which can be specified
-        using the test_conf::results_dir option and is by default wiped from
-        all the previous contents (if wipe=True)
-
-        :param target_conf: the HW target we want to use
-        :type target_conf: dict
-
-        :param test_conf: the SW setup of the HW target in use
-        :type test_conf: dict
-
-        :param wipe: set true to cleanup all previous content from the output
-        folder
-        :type wipe: bool
-
-        :param force_new: Create a new TestEnv object even if there is
-        one available for this session.  By default, TestEnv only
-        creates one object per session, use this to override this
-        behaviour.
-        :type force_new: bool
-        """
         super(TestEnv, self).__init__()
 
         if self._initialized and not force_new:
             return
 
-        self.conf = None
-        self.test_conf = None
-        self.res_dir = None
+        self.conf = {}
+        self.test_conf = {}
         self.target = None
         self.ftrace = None
         self.workdir = WORKING_DIR_DEFAULT
-        self.__tools = []
         self.__installed_tools = set()
         self.__modules = []
         self.__connection_settings = None
@@ -159,57 +225,33 @@ class TestEnv(ShareState):
             self.workdir = self.conf['workdir']
 
         # Initialize binary tools to deploy
-        if 'tools' in self.conf:
-            self.__tools = self.conf['tools']
-        # Merge tests specific tools
-        if self.test_conf and 'tools' in self.test_conf and \
-           self.test_conf['tools']:
-            if 'tools' not in self.conf:
-                self.conf['tools'] = []
-            self.__tools = list(set(
-                self.conf['tools'] + self.test_conf['tools']
-            ))
+        test_conf_tools = self.test_conf.get('tools', [])
+        target_conf_tools = self.conf.get('tools', [])
+        self.__tools = list(set(test_conf_tools + target_conf_tools))
 
         # Initialize ftrace events
         # test configuration override target one
-        if self.test_conf and 'ftrace' in self.test_conf:
+        if 'ftrace' in self.test_conf:
             self.conf['ftrace'] = self.test_conf['ftrace']
-        if 'ftrace' in self.conf and self.conf['ftrace']:
+        if self.conf.get('ftrace'):
             self.__tools.append('trace-cmd')
-
-        # Add tools dependencies
-        if 'rt-app' in self.__tools:
-            self.__tools.append('taskset')
-            self.__tools.append('trace-cmd')
-            self.__tools.append('perf')
-            self.__tools.append('cgroup_run_into.sh')
-        # Sanitize list of dependencies to remove duplicates
-        self.__tools = list(set(self.__tools))
 
         # Initialize features
         if '__features__' not in self.conf:
             self.conf['__features__'] = []
 
-        self._init()
-
-        # Initialize FTrace events collection
-        self._init_ftrace(True)
-
-        # Initialize RT-App calibration values
-        self.calibration()
-
         # Initialize local results folder
-        # test configuration override target one
-        if self.test_conf and 'results_dir' in self.test_conf:
-            self.res_dir = self.test_conf['results_dir']
-        if not self.res_dir and 'results_dir' in self.conf:
-            self.res_dir = self.conf['results_dir']
+        # test configuration overrides target one
+        self.res_dir = (self.test_conf.get('results_dir') or
+                        self.conf.get('results_dir'))
+
         if self.res_dir and not os.path.isabs(self.res_dir):
-                self.res_dir = os.path.join(basepath, 'results', self.res_dir)
+            self.res_dir = os.path.join(basepath, 'results', self.res_dir)
         else:
             self.res_dir = os.path.join(basepath, OUT_PREFIX)
             self.res_dir = datetime.datetime.now()\
                             .strftime(self.res_dir + '/%Y%m%d_%H%M%S')
+
         if wipe and os.path.exists(self.res_dir):
             self._log.warning('Wipe previous contents of the results folder:')
             self._log.warning('   %s', self.res_dir)
@@ -221,6 +263,14 @@ class TestEnv(ShareState):
         if os.path.islink(res_lnk):
             os.remove(res_lnk)
         os.symlink(self.res_dir, res_lnk)
+
+        self._init()
+
+        # Initialize FTrace events collection
+        self._init_ftrace(True)
+
+        # Initialize RT-App calibration values
+        self.calibration()
 
         # Initialize energy probe instrument
         self._init_energy(True)
@@ -236,12 +286,8 @@ class TestEnv(ShareState):
         """
         Load the target configuration from the specified file.
 
-        The configuration file path must be relative to the test suite
-        installation root folder.
-
-        :param filepath: A string representing the path of the target
-        configuration file. This path must be relative to the root folder of
-        the test suite.
+        :param filepath: Path of the target configuration file. Relative to the
+                         root folder of the test suite.
         :type filepath: str
 
         """
@@ -359,8 +405,9 @@ class TestEnv(ShareState):
         ########################################################################
 
         # Setup board default if not specified by configuration
+        self.nrg_model = None
         platform = None
-        self.__modules = []
+        self.__modules = ['cpufreq']
         if 'board' not in self.conf:
             self.conf['board'] = 'UNKNOWN'
 
@@ -372,12 +419,36 @@ class TestEnv(ShareState):
         # Initialize JUNO board
         elif self.conf['board'].upper() in ('JUNO', 'JUNO2'):
             platform = devlib.platform.arm.Juno()
+            self.nrg_model = juno_energy
             self.__modules = ['bl', 'hwmon', 'cpufreq']
 
         # Initialize OAK board
         elif self.conf['board'].upper() == 'OAK':
             platform = Platform(model='MT8173')
             self.__modules = ['bl', 'cpufreq']
+
+        # Initialized HiKey board
+        elif self.conf['board'].upper() == 'HIKEY':
+            self.nrg_model = hikey_energy
+            self.__modules = [ "cpufreq", "cpuidle" ]
+            platform = Platform(model='hikey')
+
+        # Initialize HiKey960 board
+        elif self.conf['board'].upper() == 'HIKEY960':
+            self.__modules = ['bl', 'cpufreq', 'cpuidle']
+            platform = Platform(model='hikey960')
+
+        # Initialize Pixel phone
+        elif self.conf['board'].upper() == 'PIXEL':
+            self.nrg_model = pixel_energy
+            self.__modules = ['bl', 'cpufreq']
+            platform = Platform(model='pixel')
+
+        # Initialize gem5 platform
+        elif self.conf['board'].upper() == 'GEM5':
+            self.nrg_model = None
+            self.__modules=['cpufreq']
+            platform = self._init_target_gem5()
 
         elif self.conf['board'] != 'UNKNOWN':
             # Initilize from platform descriptor (if available)
@@ -390,35 +461,25 @@ class TestEnv(ShareState):
                     core_clusters = self._get_clusters(core_names),
                     big_core=board.get('big_core', None)
                 )
-                self.__modules=board.get('modules', [])
+                if 'modules' in board:
+                    self.__modules = board['modules']
 
         ########################################################################
         # Modules configuration
         ########################################################################
 
-        # Refine modules list based on target.conf options
-        if 'modules' in self.conf:
-            self.__modules = list(set(
-                self.__modules + self.conf['modules']
-            ))
+        modules = set(self.__modules)
+
+        # Refine modules list based on target.conf
+        modules.update(self.conf.get('modules', []))
         # Merge tests specific modules
-        if self.test_conf and 'modules' in self.test_conf and \
-           self.test_conf['modules']:
-            self.__modules = list(set(
-                self.__modules + self.test_conf['modules']
-            ))
+        modules.update(self.test_conf.get('modules', []))
 
-        # Initialize modules to exclude on the target
-        if 'exclude_modules' in self.conf:
-            for module in self.conf['exclude_modules']:
-                if module in self.__modules:
-                    self.__modules.remove(module)
-        # Remove tests specific modules
-        if self.test_conf and 'exclude_modules' in self.test_conf:
-            for module in self.test_conf['exclude_modules']:
-                if module in self.__modules:
-                    self.__modules.remove(module)
+        remove_modules = set(self.conf.get('exclude_modules', []) +
+                             self.test_conf.get('exclude_modules', []))
+        modules.difference_update(remove_modules)
 
+        self.__modules = list(modules)
         self._log.info('Devlib modules to load: %s', self.__modules)
 
         ########################################################################
@@ -498,22 +559,87 @@ class TestEnv(ShareState):
                 raise RuntimeError('Failed to initialized [{}] module, '
                         'update your kernel or test configurations'.format(module))
 
+        if not self.nrg_model:
+            try:
+                self._log.info('Attempting to read energy model from target')
+                self.nrg_model = EnergyModel.from_target(self.target)
+            except (TargetError, RuntimeError, ValueError) as e:
+                self._log.error("Couldn't read target energy model: %s", e)
+
+    def _init_target_gem5(self):
+        system = self.conf['gem5']['system']
+        simulator = self.conf['gem5']['simulator']
+
+        # Get gem5 binary arguments
+        args = simulator.get('args', [])
+        args.append('--listener-mode=on')
+
+        # Get platform description
+        args.append(system['platform']['description'])
+
+        # Get platform arguments
+        args += system['platform'].get('args', [])
+        args += ['--kernel {}'.format(system['kernel']),
+                 '--dtb {}'.format(system['dtb']),
+                 '--disk-image {}'.format(system['disk'])]
+
+        # Gather all arguments
+        args = ' '.join(args)
+
+        diod_path = which('diod')
+        if diod_path is None:
+            raise RuntimeError('Failed to find "diod" on your host machine, '
+                               'check your installation or your PATH variable')
+
+        # Setup virtio
+        # Brackets are there to let the output dir be created automatically
+        virtio_args = '--which-diod={} --workload-automation-vio={{}}'.format(diod_path)
+
+        # Change conf['board'] to include platform information
+        suffix = os.path.splitext(os.path.basename(
+            system['platform']['description']))[0]
+        self.conf['board'] = self.conf['board'].lower() + suffix
+
+        board = self._load_board(self.conf['board'])
+
+        # Merge all arguments
+        platform = devlib.platform.gem5.Gem5SimulationPlatform(
+            name = 'gem5',
+            gem5_bin = simulator['bin'],
+            gem5_args = args,
+            gem5_virtio = virtio_args,
+            host_output_dir = self.res_dir,
+            core_names = board['cores'] if board else None,
+            core_clusters = self._get_clusters(board['cores']) if board else None,
+            big_core = board.get('big_core', None) if board else None,
+        )
+
+        return platform
+
     def install_tools(self, tools):
         """
-        Install tools additional to those specified in the test config
+        Install tools additional to those specified in the test config 'tools'
+        field
 
         :param tools: The list of names of tools to install
         :type tools: list(str)
         """
+        tools = set(tools)
+
+        # Add tools dependencies
+        if 'rt-app' in tools:
+            tools.update(['taskset', 'trace-cmd', 'perf', 'cgroup_run_into.sh'])
+
+        # Remove duplicates and already-instaled tools
+        tools.difference_update(self.__installed_tools)
+
         tools_to_install = []
         for tool in tools:
-            if tool in self.__installed_tools:
-                continue
             binary = '{}/tools/scripts/{}'.format(basepath, tool)
             if not os.path.isfile(binary):
                 binary = '{}/tools/{}/{}'\
                          .format(basepath, self.target.abi, tool)
-                tools_to_install.append(binary)
+            tools_to_install.append(binary)
 
         for tool_to_install in tools_to_install:
             self.target.install(tool_to_install)
@@ -666,6 +792,18 @@ class TestEnv(ShareState):
         # Adding topology information
         self.platform['topology'] = self.topology.get_level("cluster")
 
+        # Adding kernel build information
+        kver = self.target.kernel_version
+        self.platform['kernel'] = {t: getattr(kver, t, None)
+            for t in [
+                'release', 'version',
+                'version_number', 'major', 'minor',
+                'rc', 'sha1', 'parts'
+            ]
+        }
+        self.platform['abi'] = self.target.abi
+        self.platform['os'] = self.target.os
+
         self._log.debug('Platform descriptor initialized\n%s', self.platform)
         # self.platform_dump('./')
 
@@ -677,17 +815,20 @@ class TestEnv(ShareState):
         return (self.platform, plt_file)
 
     def calibration(self, force=False):
+        """
+        Get rt-app calibration. Run calibration on target if necessary.
+
+        :param force: Always run calibration on target, even if we have not
+                      installed rt-app or have already run calibration.
+        :returns: A dict with calibration results, which can be passed as the
+                  ``calibration`` parameter to :class:`RTA`, or ``None`` if
+                  force=False and we have not installed rt-app.
+        """
 
         if not force and self._calib:
             return self._calib
 
-        required = False
-        if force:
-            required = True
-        if 'rt-app' in self.__tools:
-            required = True
-        elif 'wloads' in self.conf:
-            required = any(['rt-app' in wl['type'] for wl in wloads])
+        required = force or 'rt-app' in self.__installed_tools
 
         if not required:
             self._log.debug('No RT-App workloads, skipping calibration')
@@ -710,6 +851,15 @@ class TestEnv(ShareState):
         return self._calib
 
     def resolv_host(self, host=None):
+        """
+        Resolve a host name or IP address to a MAC address
+
+        .. TODO Is my networking terminology correct here?
+
+        :param host: IP address or host name to resolve. If None, use 'host'
+                    value from target_config.
+        :type host: str
+        """
         if host is None:
             host = self.conf['host']
 
@@ -777,6 +927,14 @@ class TestEnv(ShareState):
         return (macaddr, ipaddr)
 
     def reboot(self, reboot_time=120, ping_time=15):
+        """
+        Reboot target.
+
+        :param boot_time: Time to wait for the target to become available after
+                          reboot before declaring failure.
+        :param ping_time: Period between attempts to ping the target while
+                          waiting for reboot.
+        """
         # Send remote target a reboot command
         if self._feature('no-reboot'):
             self._log.warning('Reboot disabled by conf features')
@@ -830,6 +988,16 @@ class TestEnv(ShareState):
         self._init_energy(force)
 
     def install_kernel(self, tc, reboot=False):
+        """
+        Deploy kernel and DTB via TFTP, optionally rebooting
+
+        :param tc: Dicionary containing optional keys 'kernel' and 'dtb'. Values
+                   are paths to the binaries to deploy.
+        :type tc: dict
+
+        :param reboot: Reboot thet target after deployment
+        :type reboot: bool
+        """
 
         # Default initialize the kernel/dtb settings
         tc.setdefault('kernel', None)
@@ -878,6 +1046,9 @@ class TestEnv(ShareState):
 
 
     def tftp_deploy(self, src):
+        """
+        .. TODO
+        """
 
         tftp = self.conf['tftp']
 

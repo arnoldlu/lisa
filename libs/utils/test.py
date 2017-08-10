@@ -45,22 +45,19 @@ class LisaTest(unittest.TestCase):
     _getExperimentsConf to generate target-dependent experiments.
 
     Example users of this class can be found under LISA's tests/ directory.
+
+    :ivar experiments: List of :class:`Experiment` s executed for the test. Only
+                       available after :meth:`init` has been called.
     """
 
     test_conf = None
     """Override this with a dictionary or JSON path to configure the TestEnv"""
 
     experiments_conf = None
-    """Override this with a dictionary to configure the Executor"""
+    """Override this with a dictionary or JSON path to configure the Executor"""
 
-    @classmethod
-    def _init(cls, *args, **kwargs):
-        """
-        Set up logging and trigger running experiments
-        """
-
-        cls.logger = logging.getLogger('LisaTest')
-        cls._runExperiments()
+    permitted_fail_pct = 0
+    """The percentage of iterations of each test that may be permitted to fail"""
 
     @classmethod
     def _getTestConf(cls):
@@ -83,16 +80,29 @@ class LisaTest(unittest.TestCase):
         return cls.experiments_conf
 
     @classmethod
-    def _runExperiments(cls):
+    def runExperiments(cls):
         """
-        Default experiments execution engine
+        Set up logging and trigger running experiments
         """
+        cls._log = logging.getLogger('LisaTest')
 
-        cls.logger.info('Setup tests execution engine...')
+        cls._log.info('Setup tests execution engine...')
         test_env = TestEnv(test_conf=cls._getTestConf())
 
         experiments_conf = cls._getExperimentsConf(test_env)
+
+        if ITERATIONS_FROM_CMDLINE:
+            if 'iterations' in experiments_conf:
+                cls.logger.warning(
+                    "Command line overrides iteration count in "
+                    "{}'s experiments_conf".format(cls.__name__))
+            experiments_conf['iterations'] = ITERATIONS_FROM_CMDLINE
+
         cls.executor = Executor(test_env, experiments_conf)
+
+        # Alias tests and workloads configurations
+        cls.wloads = cls.executor._experiments_conf["wloads"]
+        cls.confs = cls.executor._experiments_conf["confs"]
 
         # Alias executor objects to make less verbose tests code
         cls.te = cls.executor.te
@@ -101,8 +111,10 @@ class LisaTest(unittest.TestCase):
         # Execute pre-experiments code defined by the test
         cls._experimentsInit()
 
-        cls.logger.info('Experiments execution...')
+        cls._log.info('Experiments execution...')
         cls.executor.run()
+
+        cls.experiments = cls.executor.experiments
 
         # Execute post-experiments code defined by the test
         cls._experimentsFinalize()
@@ -125,7 +137,7 @@ class LisaTest(unittest.TestCase):
         Return a SchedAssert over the task provided
         """
         return SchedAssert(
-            self.get_trace(experment), self.te.topology, execname=task)
+            self.get_trace(experiment).ftrace, self.te.topology, execname=task)
 
     @memoized
     def get_multi_assert(self, experiment, task_filter=""):
@@ -153,8 +165,7 @@ class LisaTest(unittest.TestCase):
                 'to your test/experiment configuration flags')
 
         events = self.test_conf['ftrace']['events']
-        tasks = experiment.wload.tasks.keys()
-        trace = Trace(self.te.platform, experiment.out_dir, events, tasks)
+        trace = Trace(self.te.platform, experiment.out_dir, events)
 
         self.__traces[experiment.out_dir] = trace
         return trace
@@ -191,6 +202,18 @@ class LisaTest(unittest.TestCase):
 
         return end_times
 
+    def _dummy_method(self):
+        pass
+
+    # In the Python unittest framework you instantiate TestCase objects passing
+    # the name of a test method that is going to be run to make assertions. We
+    # run our tests using nosetests, which automatically discovers these
+    # methods. However we also want to be able to instantiate LisaTest objects
+    # in notebooks without the inconvenience of having to provide a methodName,
+    # since we won't need any assertions. So we'll override __init__ with a
+    # default dummy test method that does nothing.
+    def __init__(self, methodName='_dummy_method', *args, **kwargs):
+        super(LisaTest, self).__init__(methodName, *args, **kwargs)
 
 @wrapt.decorator
 def experiment_test(wrapped_test, instance, args, kwargs):
@@ -200,18 +223,51 @@ def experiment_test(wrapped_test, instance, args, kwargs):
     The method will be passed the experiment object and a list of the names of
     tasks that were run as the experiment's workload.
     """
+    failures = {}
     for experiment in instance.executor.experiments:
         tasks = experiment.wload.tasks.keys()
         try:
             wrapped_test(experiment, tasks, *args, **kwargs)
         except AssertionError as e:
             trace_relpath = os.path.join(experiment.out_dir, "trace.dat")
-            add_msg = "\n\tCheck trace file: " + os.path.abspath(trace_relpath)
-            orig_msg = e.args[0] if len(e.args) else ""
-            e.args = (orig_msg + add_msg,) + e.args[1:]
-            raise
+            add_msg = "Check trace file: " + os.path.abspath(trace_relpath)
+            msg = str(e) + "\n\t" +  add_msg
+
+            test_key = (experiment.wload_name, experiment.conf['tag'])
+            failures[test_key] = failures.get(test_key, []) + [msg]
+
+    for fails in failures.itervalues():
+        iterations = instance.executor.iterations
+        fail_pct = 100. * len(fails) / iterations
+
+        msg = "{} failures from {} iteration(s):\n{}".format(
+            len(fails), iterations, '\n'.join(fails))
+        if fail_pct > instance.permitted_fail_pct:
+            raise AssertionError(msg)
+        else:
+            instance._log.warning(msg)
+            instance._log.warning(
+                'ALLOWING due to permitted_fail_pct={}'.format(
+                    instance.permitted_fail_pct))
+
 
 # Prevent nosetests from running experiment_test directly as a test case
 experiment_test.__test__ = False
+
+# Allow the user to override the iterations setting from the command
+# line. Nosetests does not support this kind of thing, so we use an
+# evil hack: the lisa-test shell function takes an --iterations
+# argument and exports an environment variable. If the test itself
+# specifies an iterations count, we'll later print a warning and
+# override it. We do this here in the root scope, rather than in
+# runExperiments, so that if the value is invalid we print the error
+# immediately instead of going ahead with target setup etc.
+try:
+    ITERATIONS_FROM_CMDLINE = int(
+        os.getenv('LISA_TEST_ITERATIONS', '0'))
+    if ITERATIONS_FROM_CMDLINE < 0:
+        raise ValueError('Cannot be negative')
+except ValueError as e:
+    raise ValueError("Couldn't read iterations count: {}".format(e))
 
 # vim :set tabstop=4 shiftwidth=4 expandtab

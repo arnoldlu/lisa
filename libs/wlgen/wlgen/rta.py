@@ -31,23 +31,32 @@ class Phase(_Phase):
     """
     Descriptor for an RT-App load phase
 
-    :param duration_s: the phase duration in [s]
+    :param duration_s: the phase duration in [s].
     :type duration_s: int
 
-    :param period_ms: the phase period in [ms]
+    :param period_ms: the phase period in [ms].
     :type period_ms: int
 
-    :param duty_cycle_pct: the generated load in [%]
+    :param duty_cycle_pct: the generated load in [%].
     :type duty_cycle_pct: int
     """
     pass
 
 class RTA(Workload):
+    """
+    Class for creating RT-App workloads
+    """
 
     def __init__(self,
                  target,
                  name,
                  calibration=None):
+        """
+        :param target: Devlib target to run workload on.
+        :param name: Human-readable name for the workload.
+        :param calibration: CPU calibration specification. Can be obtained from
+                            :meth:`calibrate`.
+        """
 
         # Setup logging
         self._log = logging.getLogger('RTApp')
@@ -58,7 +67,7 @@ class RTA(Workload):
         # TODO: Assume rt-app is pre-installed on target
         # self.target.setup('rt-app')
 
-        super(RTA, self).__init__(target, name, calibration)
+        super(RTA, self).__init__(target, name)
 
         # rt-app executor
         self.wtype = 'rtapp'
@@ -77,13 +86,26 @@ class RTA(Workload):
 
     @staticmethod
     def calibrate(target):
+        """
+        Calibrate RT-App on each CPU in the system
+
+        :param target: Devlib target to run calibration on.
+        :returns: Dict mapping CPU numbers to RT-App calibration values.
+        """
         pload_regexp = re.compile(r'pLoad = ([0-9]+)ns')
         pload = {}
 
         # Setup logging
         log = logging.getLogger('RTApp')
 
-        # target.cpufreq.save_governors()
+        # Save previous governors
+        old_governors = {}
+        for domain in target.cpufreq.iter_domains():
+            cpu = domain[0]
+            governor = target.cpufreq.get_governor(cpu)
+            tunables = target.cpufreq.get_governor_tunables(cpu)
+            old_governors[cpu] = governor, tunables
+
         target.cpufreq.set_all_governors('performance')
 
         for cpu in target.list_online_cpus():
@@ -118,7 +140,13 @@ class RTA(Workload):
                 pload[cpu] = int(pload_match.group(1))
                 log.debug('>>> cpu%d: %d', cpu, pload[cpu])
 
-        # target.cpufreq.load_governors()
+        # Restore previous governors
+        #   Setting a governor & tunables for a cpu will set them for all cpus
+        #   in the same clock domain, so only restoring them for one cpu
+        #   per domain is enough to restore them all.
+        for cpu, (governor, tunables) in old_governors.iteritems():
+            target.cpufreq.set_governor(cpu, governor)
+            target.cpufreq.set_governor_tunables(cpu, **tunables)
 
         log.info('Target RT-App calibration:')
         log.info("{" + ", ".join('"%r": %r' % (key, pload[key])
@@ -144,115 +172,37 @@ class RTA(Workload):
             return
         self._log.debug('Pulling logfiles to [%s]...', destdir)
         for task in self.tasks.keys():
-            logfile = "'{0:s}/*{1:s}*.log'"\
-                    .format(self.run_dir, task)
+            logfile = self.target.path.join(self.run_dir,
+                                            '*{}*.log'.format(task))
             self.target.pull(logfile, destdir)
         self._log.debug('Pulling JSON to [%s]...', destdir)
-        self.target.pull('{}/{}'.format(self.run_dir, self.json), destdir)
-        logfile = '{}/output.log'.format(destdir)
+        self.target.pull(self.target.path.join(self.run_dir, self.json),
+                         destdir)
+        logfile = self.target.path.join(destdir, 'output.log')
         self._log.debug('Saving output on [%s]...', logfile)
         with open(logfile, 'w') as ofile:
             for line in self.output['executor'].split('\n'):
                 ofile.write(line+'\n')
 
-    def _getFirstBiggest(self, cpus):
-        # Non big.LITTLE system:
-        if 'bl' not in self.target.modules:
-            # return the first CPU of the last cluster
-            platform = self.target.platform
-            cluster_last = list(set(platform.core_clusters))[-1]
-            cluster_cpus = [cpu_id
-                    for cpu_id, cluster_id in enumerate(platform.core_clusters)
-                                           if cluster_id == cluster_last]
-            # If CPUs have been specified': return the fist in the last cluster
-            if cpus:
-                for cpu_id in cpus:
-                    if cpu_id in cluster_cpus:
-                        return cpu_id
-            # Otherwise just return the first cpu of the last cluster
-            return cluster_cpus[0]
-
-        # big.LITTLE system:
-        for c in cpus:
-             if c not in self.target.bl.bigs:
-                continue
-             return c
-        # Only LITTLE CPUs, thus:
-        #  return the first possible cpu
-        return cpus[0]
-
-    def _getFirstBig(self, cpus=None):
-        # Non big.LITTLE system:
-        if 'bl' not in self.target.modules:
-            return self._getFirstBiggest(cpus)
-        if cpus:
-            for c in cpus:
-                if c not in self.target.bl.bigs:
-                    continue
-                return c
-        # Only LITTLE CPUs, thus:
-        #  return the first big core of the system
-        if self.target.big_core:
-            # Big.LITTLE system
-            return self.target.bl.bigs[0]
-        return 0
-
-    def _getFirstLittle(self, cpus=None):
-        # Non big.LITTLE system:
-        if 'bl' not in self.target.modules:
-            # return the first CPU of the first cluster
-            platform = self.target.platform
-            cluster_first = list(set(platform.core_clusters))[0]
-            cluster_cpus = [cpu_id
-                    for cpu_id, cluster_id in enumerate(platform.core_clusters)
-                                           if cluster_id == cluster_first]
-            # If CPUs have been specified': return the fist in the first cluster
-            if cpus:
-                for cpu_id in cpus:
-                    if cpu_id in cluster_cpus:
-                        return cpu_id
-            # Otherwise just return the first cpu of the first cluster
-            return cluster_cpus[0]
-
-        # Try to return one LITTLE CPUs among the specified ones
-        if cpus:
-            for c in cpus:
-                if c not in self.target.bl.littles:
-                    continue
-                return c
-        # Only big CPUs, thus:
-        #  return the first LITTLE core of the system
-        if self.target.little_core:
-            # Big.LITTLE system
-            return self.target.bl.littles[0]
-        return 0
-
-    def getTargetCpu(self, loadref):
+    def getCalibrationConf(self):
         # Select CPU for task calibration, which is the first little
         # of big depending on the loadref tag
         if self.pload is not None:
-            if loadref and loadref.upper() == 'LITTLE':
-                target_cpu = self._getFirstLittle()
-                self._log.debug('ref on LITTLE cpu: %d', target_cpu)
+            if self.loadref and self.loadref.upper() == 'LITTLE':
+                return max(self.pload.values())
             else:
-                target_cpu = self._getFirstBig()
-                self._log.debug('ref on big cpu: %d', target_cpu)
-            return target_cpu
-
-        # These options are selected only when RTApp has not been
-        # already calibrated
-        if self.cpus is None:
-            target_cpu = self._getFirstBig()
-            self._log.debug('ref on cpu: %d', target_cpu)
+                return min(self.pload.values())
         else:
-            target_cpu = self._getFirstBiggest(self.cpus)
-            self._log.debug('ref on (possible) biggest cpu: %d', target_cpu)
-        return target_cpu
+            cpus = self.cpus or range(self.target.number_of_cpus)
 
-    def getCalibrationConf(self, target_cpu=0):
-        if self.pload is None:
+            target_cpu = cpus[-1]
+            if 'bl'in self.target.modules:
+                cluster = self.target.bl.bigs
+                candidates = sorted(set(self.target.bl.bigs).intersection(cpus))
+                if candidates:
+                    target_cpu = candidates[0]
+
             return 'CPU{0:d}'.format(target_cpu)
-        return self.pload[target_cpu]
 
     def _confCustom(self):
 
@@ -268,14 +218,18 @@ class RTA(Workload):
         if self.duration is None:
             raise ValueError('Workload duration not specified')
 
-        target_cpu = self.getTargetCpu(self.loadref)
-        calibration = self.getCalibrationConf(target_cpu)
-
         self._log.info('Loading custom configuration:')
         self._log.info('   %s', rtapp_conf)
         self.json = '{0:s}_{1:02d}.json'.format(self.name, self.exc_id)
         ofile = open(self.json, 'w')
         ifile = open(rtapp_conf, 'r')
+
+        calibration = self.getCalibrationConf()
+        # Calibration can either be a string like "CPU1" or an integer, if the
+        # former we need to quote it.
+        if type(calibration) != int:
+            calibration = '"{}"'.format(calibration)
+
         replacements = {
             '__DURATION__' : str(self.duration),
             '__PVALUE__'   : str(calibration),
@@ -290,12 +244,17 @@ class RTA(Workload):
         ifile.close()
         ofile.close()
 
+        with open(self.json) as f:
+            conf = json.load(f)
+        for tid in conf['tasks']:
+            self.tasks[tid] = {'pid': -1}
+
         return self.json
 
     def _confProfile(self):
 
         # Sanity check for task names
-        for task in self.params.keys():
+        for task in self.params['profile'].keys():
             if len(task) > 15:
                 # rt-app uses pthread_setname_np(3) which limits the task name
                 # to 16 characters including the terminal '\0'.
@@ -304,7 +263,6 @@ class RTA(Workload):
                 raise ValueError(msg)
 
         # Task configuration
-        target_cpu = self.getTargetCpu(self.loadref)
         self.rta_profile = {
             'tasks': {},
             'global': {}
@@ -314,13 +272,10 @@ class RTA(Workload):
         global_conf = {
                 'default_policy': 'SCHED_OTHER',
                 'duration': -1,
-                'calibration': 'CPU'+str(target_cpu),
+                'calibration': self.getCalibrationConf(),
                 'logdir': self.run_dir,
             }
 
-        # Setup calibration data
-        calibration = self.getCalibrationConf(target_cpu)
-        global_conf['calibration'] = calibration
         if self.duration is not None:
             global_conf['duration'] = self.duration
             self._log.warn('Limiting workload duration to %d [s]',
@@ -371,12 +326,9 @@ class RTA(Workload):
 
             if 'delay' in task.keys():
                 if task['delay'] > 0:
-                    task_conf['phases']['p000000'] = {}
-                    task_conf['phases']['p000000']['delay'] = int(task['delay'] * 1e6)
+                    task_conf['delay'] = int(task['delay'] * 1e6)
                     self._log.info(' | start delay: %.6f [s]',
                             task['delay'])
-
-            self._log.info(' | calibration CPU: %d', target_cpu)
 
             if 'loops' not in task.keys():
                 task['loops'] = 1
@@ -483,32 +435,41 @@ class RTA(Workload):
         workloads. The classes supported so far are detailed hereafter.
 
         Custom workloads
-        ----------------
-        When 'kind' is 'custom' the tasks generated by this workload are the
-        ones defined in a provided rt-app JSON configuration file.
-        In this case the 'params' parameter must be used to specify the
-        complete path of the rt-app JSON configuration file to use.
-
+          When 'kind' is 'custom' the tasks generated by this workload are the
+          ones defined in a provided rt-app JSON configuration file.
+          In this case the 'params' parameter must be used to specify the
+          complete path of the rt-app JSON configuration file to use.
 
         Profile based workloads
-        -----------------------
-        When 'kind' is 'profile' the tasks generated by this workload have a
-        profile which is defined by a sequence of phases and they are defined
-        according to the following grammar:
+          When ``kind`` is "profile", ``params`` is a dictionary mapping task
+          names to task specifications. The easiest way to create these task
+          specifications using :meth:`RTATask.get`.
 
-          params := {task, ...}
-          task   := NAME : {SCLASS, PRIO, [phase, ...]}
-          phase  := (PTIME, PRIOD, DCYCLE)
+          For example, the following configures an RTA workload with a single
+          task, named 't1', using the default parameters for a Periodic RTATask:
 
-        where the terminals are:
+          ::
 
-          NAME   : string, the task name (max 16 chars)
-          SCLASS : string, the scheduling class (OTHER, FIFO, RR)
-          PRIO   : int, the priority of the task
-          PTIME  : float, length of the current phase in [s]
-          PERIOD : float, task activation interval in [ms]
-          DCYCLE : int, task running interval in [0..100]% within each period
+            wl = RTA(...)
+            wl.conf(kind='profile', params={'t1': Periodic().get()})
 
+        :param kind: Either 'custom' or 'profile' - see above.
+        :param params: RT-App parameters - see above.
+        :param duration: Maximum duration of the workload in seconds. Any
+                         remaining tasks are killed by rt-app when this time has
+                         elapsed.
+        :param cpus: CPUs to restrict this workload to, using ``taskset``.
+        :type cpus: list(int)
+
+        :param sched: Global RT-App scheduler configuration. Dict with fields:
+
+          policy
+            The default scheduler policy. Choose from 'OTHER', 'FIFO', 'RR',
+            and 'DEADLINE'.
+
+        :param run_dir: Target dir to store output and config files in.
+
+        .. TODO: document or remove loadref
         """
 
         if not sched:
@@ -536,48 +497,66 @@ class RTA(Workload):
         self.test_label = '{0:s}_{1:02d}'.format(self.name, self.exc_id)
         return self.test_label
 
-class _TaskBase(object):
+class RTATask(object):
+    """
+    Base class for conveniently constructing params to :meth:`RTA.conf`
+
+    This class represents an RT-App task which may contain multiple phases. It
+    implements ``__add__`` so that using ``+`` on two tasks concatenates their
+    phases. For example ``Ramp() + Periodic()`` would yield an ``RTATask`` that
+    executes the default phases for ``Ramp`` followed by the default phases for
+    ``Periodic``.
+    """
 
     def __init__(self):
         self._task = {}
 
     def get(self):
+        """
+        Return a dict that can be passed as an element of the ``params`` field
+        to :meth:`RTA.conf`.
+        """
         return self._task
 
     def __add__(self, next_phases):
+        if next_phases._task.get('delay', 0):
+            # This won't work, because rt-app's "delay" field is per-task and
+            # not per-phase. We might be able to implement it by adding a
+            # "sleep" event here, but let's not bother unless such a need
+            # arises.
+            raise ValueError("Can't compose rt-app tasks "
+                             "when the second has nonzero 'delay_s'")
+
         self._task['phases'].extend(next_phases._task['phases'])
         return self
 
 
-class Ramp(_TaskBase):
+class Ramp(RTATask):
+    """
+    Configure a ramp load.
+
+    This class defines a task which load is a ramp with a configured number
+    of steps according to the input parameters.
+
+    :param start_pct: the initial load percentage.
+    :param end_pct: the final load percentage.
+    :param delta_pct: the load increase/decrease at each step, in percentage
+                      points.
+    :param time_s: the duration in seconds of each load step.
+    :param period_ms: the period used to define the load in [ms].
+    :param delay_s: the delay in seconds before ramp start.
+    :param loops: number of time to repeat the ramp, with the specified delay in
+                  between.
+
+    :param sched: the scheduler configuration for this task.
+    :type sched: dict
+
+    :param cpus: the list of CPUs on which task can run.
+    :type cpus: list(int)
+    """
 
     def __init__(self, start_pct=0, end_pct=100, delta_pct=10, time_s=1,
                  period_ms=100, delay_s=0, loops=1, sched=None, cpus=None):
-        """
-        Configure a ramp load.
-
-        This class defines a task which load is a ramp with a configured number
-        of steps according to the input parameters.
-
-        Args:
-            start_pct (int, [0-100]): the initial load [%], (default 0[%])
-            end_pct   (int, [0-100]): the final load [%], (default 100[%])
-            delta_pct (int, [0-100]): the load increase/decrease [%],
-                                      default: 10[%]
-                                      increase if start_prc < end_prc
-                                      decrease  if start_prc > end_prc
-            time_s    (float): the duration in [s] of each load step
-                               default: 1.0[s]
-            period_ms (float): the period used to define the load in [ms]
-                               default: 100.0[ms]
-            delay_s   (float): the delay in [s] before ramp start
-                               default: 0[s]
-            loops     (int):   number of time to repeat the ramp, with the
-                               specified delay in between
-                               default: 0
-            sched     (dict): the scheduler configuration for this task
-            cpus      (list): the list of CPUs on which task can run
-        """
         super(Ramp, self).__init__()
 
         self._task['cpus'] = cpus
@@ -611,73 +590,67 @@ class Ramp(_TaskBase):
         self._task['phases'] = phases
 
 class Step(Ramp):
+    """
+    Configure a step load.
+
+    This class defines a task which load is a step with a configured initial and
+    final load. Using the ``loops`` param, this can be used to create a workload
+    that alternates between two load values.
+
+    :param start_pct: the initial load percentage.
+    :param end_pct: the final load percentage.
+    :param time_s: the duration in seconds of each load step.
+    :param period_ms: the period used to define the load in [ms].
+    :param delay_s: the delay in seconds before ramp start.
+    :param loops: number of time to repeat the step, with the specified delay in
+                  between.
+
+    :param sched: the scheduler configuration for this task.
+    :type sched: dict
+
+    :param cpus: the list of CPUs on which task can run.
+    :type cpus: list(int)
+    """
 
     def __init__(self, start_pct=0, end_pct=100, time_s=1, period_ms=100,
                  delay_s=0, loops=1, sched=None, cpus=None):
-        """
-        Configure a step load.
-
-        This class defines a task which load is a step with a configured
-        initial and final load.
-
-        Args:
-            start_pct (int, [0-100]): the initial load [%]
-                                      default 0[%])
-            end_pct   (int, [0-100]): the final load [%]
-                                      default 100[%]
-            time_s    (float): the duration in [s] of the start and end load
-                               default: 1.0[s]
-            period_ms (float): the period used to define the load in [ms]
-                               default 100.0[ms]
-            delay_s   (float): the delay in [s] before ramp start
-                               default 0[s]
-            loops     (int):   number of time to repeat the ramp, with the
-                               specified delay in between
-                               default: 0
-            sched     (dict): the scheduler configuration for this task
-            cpus      (list): the list of CPUs on which task can run
-        """
         delta_pct = abs(end_pct - start_pct)
         super(Step, self).__init__(start_pct, end_pct, delta_pct, time_s,
                                    period_ms, delay_s, loops, sched, cpus)
 
-class Pulse(_TaskBase):
+class Pulse(RTATask):
+    """
+    Configure a pulse load.
+
+    This class defines a task which load is a pulse with a configured
+    initial and final load.
+
+    The main difference with the 'step' class is that a pulse workload is
+    by definition a 'step down', i.e. the workload switch from an finial
+    load to a final one which is always lower than the initial one.
+    Moreover, a pulse load does not generate a sleep phase in case of 0[%]
+    load, i.e. the task ends as soon as the non null initial load has
+    completed.
+
+    :param start_pct: the initial load percentage.
+    :param end_pct: the final load percentage. Must be lower than ``start_pct``
+                    value. If end_pct is 0, the task end after the ``start_pct``
+                    period has completed.
+    :param time_s: the duration in seconds of each load step.
+    :param period_ms: the period used to define the load in [ms].
+    :param delay_s: the delay in seconds before ramp start.
+    :param loops: number of time to repeat the pulse, with the specified delay
+                  in between.
+
+    :param sched: the scheduler configuration for this task.
+    :type sched: dict
+
+    :param cpus: the list of CPUs on which task can run
+    :type cpus: list(int)
+    """
 
     def __init__(self, start_pct=100, end_pct=0, time_s=1, period_ms=100,
                  delay_s=0, loops=1, sched=None, cpus=None):
-        """
-        Configure a pulse load.
-
-        This class defines a task which load is a pulse with a configured
-        initial and final load.
-
-        The main difference with the 'step' class is that a pulse workload is
-        by definition a 'step down', i.e. the workload switch from an finial
-        load to a final one which is always lower than the initial one.
-        Moreover, a pulse load does not generate a sleep phase in case of 0[%]
-        load, i.e. the task ends as soon as the non null initial load has
-        completed.
-
-        Args:
-            start_pct (int, [0-100]): the initial load [%]
-                                      default: 0[%]
-            end_pct   (int, [0-100]): the final load [%]
-                                      default: 100[%]
-                      NOTE: must be lower than start_pct value
-            time_s    (float): the duration in [s] of the start and end load
-                               default: 1.0[s]
-                               NOTE: if end_pct is 0, the task end after the
-                               start_pct period completed
-            period_ms (float): the period used to define the load in [ms]
-                               default: 100.0[ms]
-            delay_s   (float): the delay in [s] before ramp start
-                               default: 0[s]
-            loops     (int):   number of time to repeat the ramp, with the
-                               specified delay in between
-                               default: 0
-            sched     (dict):  the scheduler configuration for this task
-            cpus      (list):  the list of CPUs on which task can run
-        """
         super(Pulse, self).__init__()
 
         if end_pct >= start_pct:
@@ -709,30 +682,25 @@ class Pulse(_TaskBase):
 
 
 class Periodic(Pulse):
+    """
+    Configure a periodic load. This is the simplest type of RTA task.
+
+    This class defines a task which load is periodic with a configured
+    period and duty-cycle.
+
+    :param duty_cycle_pct: the load percentage.
+    :param duration_s: the total duration in seconds of the task.
+    :param period_ms: the period used to define the load in milliseconds.
+    :param delay_s: the delay in seconds before starting the periodic phase.
+
+    :param sched: the scheduler configuration for this task.
+    :type sched: dict
+
+    :param cpus: the list of CPUs on which task can run.
+    :type cpus: list(int)
+    """
 
     def __init__(self, duty_cycle_pct=50, duration_s=1, period_ms=100,
                  delay_s=0, sched=None, cpus=None):
-        """
-        Configure a periodic load.
-
-        This class defines a task which load is periodic with a configured
-        period and duty-cycle.
-
-        This class is a specialization of the 'pulse' class since a periodic
-        load is generated as a sequence of pulse loads.
-
-        Args:
-            cuty_cycle_pct  (int, [0-100]): the pulses load [%]
-                                            default: 50[%]
-            duration_s  (float): the duration in [s] of the entire workload
-                                 default: 1.0[s]
-            period_ms   (float): the period used to define the load in [ms]
-                                 default: 100.0[ms]
-            delay_s     (float): the delay in [s] before ramp start
-                                 default: 0[s]
-            sched       (dict):  the scheduler configuration for this task
-
-        """
         super(Periodic, self).__init__(duty_cycle_pct, 0, duration_s,
                                        period_ms, delay_s, 1, sched, cpus)
-

@@ -94,7 +94,7 @@ class TasksAnalysis(AnalysisModule):
 
         # Add task name column
         big_tasks_stats['comm'] = big_tasks_stats.index.map(
-            lambda pid: ', '.join(self._trace.getTaskByPid(pid)))
+            lambda pid: self._trace.getTaskByPid(pid))
 
         # Filter columns of interest
         big_tasks_stats = big_tasks_stats[['count', 'comm']]
@@ -132,7 +132,7 @@ class TasksAnalysis(AnalysisModule):
 
         # Add task name column
         wkp_tasks_stats['comm'] = wkp_tasks_stats.index.map(
-            lambda pid: ', '.join(self._trace.getTaskByPid(pid)))
+            lambda pid: self._trace.getTaskByPid(pid))
 
         # Filter columns of interest
         wkp_tasks_stats = wkp_tasks_stats[['count', 'comm']]
@@ -178,7 +178,7 @@ class TasksAnalysis(AnalysisModule):
 
         # Add task name column
         rt_tasks['comm'] = rt_tasks.index.map(
-            lambda pid: ', '.join(self._trace.getTaskByPid(pid)))
+            lambda pid: self._trace.getTaskByPid(pid))
 
         return rt_tasks
 
@@ -187,7 +187,7 @@ class TasksAnalysis(AnalysisModule):
 # Plotting Methods
 ###############################################################################
 
-    def plotTasks(self, tasks=None, signals=None):
+    def plotTasks(self, tasks, signals=None):
         """
         Generate a common set of useful plots for each of the specified tasks
 
@@ -200,6 +200,13 @@ class TasksAnalysis(AnalysisModule):
         Tasks PELT signals:
                 load_sum, util_sum, period_contrib, sched_overutilized
 
+        At least one of the previous signals must be specified to get a valid
+        plot.
+
+        Addidional custom signals can be specified and they will be represented
+        in the "Task signals plots" if they represent valid keys of the task
+        load/utilization trace event (e.g. sched_load_avg_task).
+
         Note:
             sched_overutilized: enable the plotting of overutilization bands on
                                 top of each subplot
@@ -208,8 +215,6 @@ class TasksAnalysis(AnalysisModule):
         :param tasks: the list of task names and/or PIDs to plot.
                       Numerical PIDs and string task names can be mixed
                       in the same list.
-                      default: all tasks defined in Trace
-                      creation time are plotted
         :type tasks: list(str) or list(int)
 
         :param signals: list of signals (and thus plots) to generate
@@ -237,8 +242,6 @@ class TasksAnalysis(AnalysisModule):
 
         if tasks:
             tasks_to_plot = listify(tasks)
-        elif self._tasks:
-            tasks_to_plot = sorted(self._tasks)
         else:
             raise ValueError('No tasks to plot specified')
 
@@ -252,13 +255,18 @@ class TasksAnalysis(AnalysisModule):
                 # Third plot: tasks's load
                 {'load_sum', 'util_sum', 'period_contrib'}
         ]
-        for signals_to_plot in plots_signals:
+        hr = []
+        ysize = 0
+        for plot_id, signals_to_plot in enumerate(plots_signals):
             signals_to_plot = signals_to_plot.intersection(signals)
             if len(signals_to_plot):
                 plots_count = plots_count + 1
+                # Use bigger size only for the first plot
+                hr.append(3 if plot_id == 0 else 1)
+                ysize = ysize + (8 if plot_id else 4)
 
         # Grid
-        gs = gridspec.GridSpec(plots_count, 1, height_ratios=[2, 1, 1])
+        gs = gridspec.GridSpec(plots_count, 1, height_ratios=hr)
         gs.update(wspace=0.1, hspace=0.1)
 
         # Build list of all PIDs for each task_name to plot
@@ -272,16 +280,14 @@ class TasksAnalysis(AnalysisModule):
             pids_to_plot.extend(self._trace.getTaskByName(task))
 
         for tid in pids_to_plot:
+            savefig = False
+
             task_name = self._trace.getTaskByPid(tid)
-            if len(task_name) == 1:
-                task_name = task_name[0]
-                self._log.info('Plotting %5d: %s...', tid, task_name)
-            else:
-                self._log.info('Plotting %5d: %s...', tid, ', '.join(task_name))
+            self._log.info('Plotting [%d:%s]...', tid, task_name)
             plot_id = 0
 
             # For each task create a figure with plots_count plots
-            plt.figure(figsize=(16, 2*6+3))
+            plt.figure(figsize=(16, ysize))
             plt.suptitle('Task Signals',
                          y=.94, fontsize=16, horizontalalignment='center')
 
@@ -294,9 +300,8 @@ class TasksAnalysis(AnalysisModule):
                                .format(tid, task_name))
                 plot_id = plot_id + 1
                 is_last = (plot_id == plots_count)
-                if 'sched_overutilized' in signals:
-                    signals_to_plot.append('sched_overutilized')
-                self._plotTaskSignals(axes, tid, signals_to_plot, is_last)
+                self._plotTaskSignals(axes, tid, signals, is_last)
+                savefig = True
 
             # Plot CPUs residency
             signals_to_plot = {'residencies'}
@@ -312,6 +317,7 @@ class TasksAnalysis(AnalysisModule):
                 if 'sched_overutilized' in signals:
                     signals_to_plot.append('sched_overutilized')
                 self._plotTaskResidencies(axes, tid, signals_to_plot, is_last)
+                savefig = True
 
             # Plot PELT signals
             signals_to_plot = {'load_sum', 'util_sum', 'period_contrib'}
@@ -324,6 +330,11 @@ class TasksAnalysis(AnalysisModule):
                 if 'sched_overutilized' in signals:
                     signals_to_plot.append('sched_overutilized')
                 self._plotTaskPelt(axes, tid, signals_to_plot)
+                savefig = True
+
+            if not savefig:
+                self._log.warning('Nothing to plot for %s', task_name)
+                continue
 
             # Save generated plots into datadir
             if isinstance(task_name, list):
@@ -377,8 +388,7 @@ class TasksAnalysis(AnalysisModule):
         for pid, group in big_frequent_tasks_events.groupby('pid'):
 
             # # Build task names (there could be multiple, during the task lifetime)
-            task_name = 'PID: {} | {}'.format(
-                pid, ' | '.join(self._trace.getTaskByPid(pid)))
+            task_name = 'Task [%d:%s]'.format(pid, self._trace.getTaskByPid(pid))
 
             # Plot title
             if big_frequent_tasks_count == 1:
@@ -628,10 +638,12 @@ class TasksAnalysis(AnalysisModule):
         util_df = self._dfg_trace_event('sched_load_avg_task')
 
         # Plot load and util
-        signals_to_plot = list({'load_avg', 'util_avg'}.intersection(signals))
-        if len(signals_to_plot):
-            data = util_df[util_df.pid == tid][signals_to_plot]
-            data.plot(ax=axes, drawstyle='steps-post')
+        signals_to_plot = set(signals).difference({'boosted_util'})
+        for signal in signals_to_plot:
+            if signal not in util_df.columns:
+                continue
+            data = util_df[util_df.pid == tid][signal]
+            data.plot(ax=axes, drawstyle='steps-post', legend=True)
 
         # Plot boost utilization if available
         if 'boosted_util' in signals and \
@@ -656,10 +668,10 @@ class TasksAnalysis(AnalysisModule):
                 'LITTLE capacity tip/max: %d/%d, big capacity tip/max: %d/%d',
                 tip_lcap, max_lcap, tip_bcap, max_bcap
             )
-            axes.axhline(tip_lcap, color='g', linestyle='--', linewidth=1)
-            axes.axhline(max_lcap, color='g', linestyle='-', linewidth=2)
-            axes.axhline(tip_bcap, color='r', linestyle='--', linewidth=1)
-            axes.axhline(max_bcap, color='r', linestyle='-', linewidth=2)
+            axes.axhline(tip_lcap, color='y', linestyle=':', linewidth=2)
+            axes.axhline(max_lcap, color='y', linestyle='--', linewidth=2)
+            axes.axhline(tip_bcap, color='r', linestyle=':', linewidth=2)
+            axes.axhline(max_bcap, color='r', linestyle='--', linewidth=2)
 
         axes.set_ylim(0, 1100)
         axes.set_xlim(self._trace.x_min, self._trace.x_max)
